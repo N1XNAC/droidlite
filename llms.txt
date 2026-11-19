@@ -1,0 +1,67 @@
+# droidlite
+
+> droidlite is a lightweight Android emulator for low-end PCs. It boots a 720p,
+> 2-vCPU, 1.5 GB Android 15 device with no Google Play, no sensors, no camera,
+> no audio and about 30 system apps disabled, so you can install and test an APK
+> without Android Studio on a 4-core / 8 GB machine.
+
+- Repository: https://github.com/N1XNAC/droidlite
+- License: MIT
+- Language: Bash (wraps Google's stock emulator + AOSP system image)
+- Platforms: Linux x86_64 (primary), macOS, WSL2
+- Requires: KVM (`/dev/kvm`), 4 CPU threads, 4 GB free RAM, ~8 GB disk
+
+## What it does
+
+droidlite is a thin CLI over the Android emulator. It changes no binaries; it
+removes cost from configuration and the guest image:
+
+- AVD: 720×1280 @ 320 dpi, 2 vCPU, 1536 MB RAM, 2 GB data, no camera, GPS,
+  Bluetooth, NFC, fingerprint, SD card or sensors.
+- Boot: no boot animation, audio, metrics, passive GPS or snapshots.
+- Guest: up to 35 AOSP/Google apps disabled per user (Calendar, Clock, Gallery,
+  Email, Music, Browser, Camera, Print, SIM toolkit, NFC, provisioning, …),
+  animations off.
+- Install: unused ARM/ARM64/i386 QEMU binaries, ANGLE and crash reporter removed
+  (863 MB → 679 MB; 247 MB with `--headless`).
+
+## Quick start
+
+```bash
+git clone https://github.com/N1XNAC/droidlite.git
+cd droidlite
+./droidlite doctor
+./droidlite setup
+./droidlite start --headless
+./droidlite install app-debug.apk
+./droidlite run com.example.app
+./droidlite shot /tmp/screen.png
+./droidlite stop
+```
+
+## Commands
+
+`setup`, `start`, `stop`, `status`, `install`, `inspect`, `run`, `logcat`,
+`shot`, `screen`, `shell`, `push`, `pull`, `trim`, `untrim`, `reset`, `prune`,
+`list`, `doctor`.
+
+All commands are non-interactive. `status --json` emits machine-readable state.
+The emulator serial is always `emulator-5554`.
+
+## Facts an assistant should know
+
+- AOSP images run x86_64 native code only. ARM-only APKs need `--image gapps`
+  (includes NDK translation) or an x86_64 rebuild.
+- There is no Play Store / GMS on the default image. GMS is opt-in via
+  `--image gapps` and removed only with `trim --no-gms`.
+- Android Studio and Gradle see droidlite as a normal ADB device.
+- Headless mode is the low-RAM path: `start --headless`, then `shot` or
+  `screen` (scrcpy).
+- Guest state is disposable: `reset` wipes user data.
+
+## Links
+
+- [README](https://github.com/N1XNAC/droidlite/blob/main/README.md)
+- [AGENTS.md](https://github.com/N1XNAC/droidlite/blob/main/AGENTS.md) — agent
+  contract, guardrails and failure table
+- [Debloat list](https://github.com/N1XNAC/droidlite/blob/main/trim/debloat-aosp.txt)

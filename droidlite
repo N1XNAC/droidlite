@@ -5,7 +5,7 @@
 # setting that costs CPU/RAM but does not help you install and use your app.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # SDK discovery: env first, then the two usual install locations.
 SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
@@ -28,7 +28,25 @@ ADB="$SDK/platform-tools/adb"
 EMULATOR="$SDK/emulator/emulator"
 SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
 AVDMANAGER="$SDK/cmdline-tools/latest/bin/avdmanager"
-AVD_HOME="${ANDROID_AVD_HOME:-$HOME/.android/avd}"
+
+# AVD location differs between tools and distros: cmdline-tools use
+# $ANDROID_AVD_HOME, else $ANDROID_USER_HOME/avd, else (with XDG set)
+# $XDG_CONFIG_HOME/.android/avd. Pick one and force every tool to agree.
+if [ -n "${ANDROID_AVD_HOME:-}" ]; then
+  AVD_HOME="$ANDROID_AVD_HOME"
+elif [ -n "${ANDROID_USER_HOME:-}" ]; then
+  AVD_HOME="$ANDROID_USER_HOME/avd"
+elif [ -n "${XDG_CONFIG_HOME:-}" ] && [ -d "$XDG_CONFIG_HOME/.android/avd" ]; then
+  AVD_HOME="$XDG_CONFIG_HOME/.android/avd"
+elif [ -d "$HOME/.android/avd" ] && [ -z "${XDG_CONFIG_HOME:-}" ]; then
+  AVD_HOME="$HOME/.android/avd"
+elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
+  AVD_HOME="$XDG_CONFIG_HOME/.android/avd"
+else
+  AVD_HOME="$HOME/.android/avd"
+fi
+export ANDROID_AVD_HOME="$AVD_HOME"
+mkdir -p "$AVD_HOME"
 
 STATE="$ROOT/.state"
 mkdir -p "$STATE"
@@ -61,11 +79,11 @@ Usage: droidlite <command> [options]
       --snapshot               Allow quick-boot snapshot (faster restarts, more disk I/O)
       --no-trim                Do not apply the debloat list
   stop                  Shut the emulator down
-  status                What is running and how much RAM it uses
+  status                What is running and how much RAM it uses (--json)
   install <apk>         adb install + AOT-compile the app
   inspect <apk>         Show package, SDK level, launch activity and ABIs
   run <pkg> [activity]  Launch the app and wait for it to be drawn
-  logcat [-c]           Stream logs from the running emulator
+  logcat [-c|-d]        Stream logs, clear (-c) or dump and exit (-d)
   shot [file.png]       Screenshot
   screen                Interactive view via scrcpy (headless mode)
   shell [command...]    adb shell passthrough
@@ -190,19 +208,32 @@ hw.sdCard=no
 hw.sensors.orientation=no
 hw.sensors.proximity=no
 hw.sensors.magnetic_field=no
-hw.sensors.acceleration=no
+hw.sensors.magnetic_field_uncalibrated=no
+hw.sensors.accelerometer=no
+hw.sensors.accelerometer_uncalibrated=no
 hw.sensors.gyroscope=no
+hw.sensors.gyroscope_uncalibrated=no
 hw.sensors.temperature=no
 hw.sensors.light=no
 hw.sensors.pressure=no
 hw.sensors.humidity=no
 hw.sensors.heart_rate=no
 hw.sensors.rgbc=no
+hw.accelerometer=no
+hw.gyroscope=no
+hw.sensors.hinge=no
+hw.sensors.roll=no
+hw.sensors.wrist_tilt=no
 hw.trackBall=no
 hw.dPad=no
 showDeviceFrame=no
 PlayStore.enabled=false
 fastboot.forceColdBoot=yes
+fastboot.forceFastBoot=no
+fastboot.forceChosenSnapshotBoot=no
+firstboot.bootFromDownloadableSnapshot=no
+firstboot.bootFromLocalSnapshot=no
+firstboot.saveToLocalSnapshot=no
 disk.dataPartition.size=2048M
 disk.cachePartition.size=64M
 hw.initialOrientation=Portrait
@@ -255,7 +286,7 @@ cmd_start() {
   [ "$cold" = 1 ] && args+=(-no-snapshot)
 
   info "starting $(avd_name) [${profile}: ${cores_v} vCPU / ${ram_v} MB / ${gpu}]"
-  nohup "$EMULATOR" "${args[@]}" > "$STATE/emulator.log" 2>&1 &
+  nohup setsid "$EMULATOR" "${args[@]}" > "$STATE/emulator.log" 2>&1 &
   echo $! > "$STATE/pid"
   echo "$SERIAL" > "$STATE/serial"
   echo "$FLAVOR" > "$STATE/flavor"
@@ -264,7 +295,7 @@ cmd_start() {
   wait_for_boot
 
   if [ "$dotrim" = 1 ] && [ ! -f "$STATE/trimmed.$(avd_name)" ]; then
-    cmd_trim --no-gms >/dev/null
+    cmd_trim >/dev/null
     touch "$STATE/trimmed.$(avd_name)"
   fi
 
@@ -317,7 +348,7 @@ cmd_trim() {
     pkg="${pkg%%#*}"; pkg="$(printf '%s' "$pkg" | tr -d '[:space:]')"
     [ -z "$pkg" ] && continue
     grep -qx "$pkg" <<<"$installed" || continue
-    if "$ADB" -s "$SERIAL" shell pm disable-user --user 0 "$pkg" >/dev/null 2>&1; then
+    if "$ADB" -s "$SERIAL" shell pm disable-user --user 0 "$pkg" </dev/null >/dev/null 2>&1; then
       n=$((n + 1))
     fi
   done < <(cat "${files[@]}")
@@ -325,7 +356,7 @@ cmd_trim() {
   if [ "$nogms" = 1 ]; then
     for pkg in com.google.android.gms com.google.android.gsf com.google.android.gms.location.history; do
       grep -qx "$pkg" <<<"$installed" || continue
-      "$ADB" -s "$SERIAL" shell pm disable-user --user 0 "$pkg" >/dev/null 2>&1 && n=$((n + 1)) || true
+      "$ADB" -s "$SERIAL" shell pm disable-user --user 0 "$pkg" </dev/null >/dev/null 2>&1 && n=$((n + 1)) || true
     done
   fi
 
@@ -339,7 +370,7 @@ cmd_untrim() {
   while IFS= read -r pkg; do
     pkg="${pkg%%#*}"; pkg="$(printf '%s' "$pkg" | tr -d '[:space:]')"
     [ -z "$pkg" ] && continue
-    if "$ADB" -s "$SERIAL" shell pm enable --user 0 "$pkg" >/dev/null 2>&1; then n=$((n + 1)); fi
+    if "$ADB" -s "$SERIAL" shell pm enable --user 0 "$pkg" </dev/null >/dev/null 2>&1; then n=$((n + 1)); fi
   done < <(cat "${files[@]}")
   rm -f "$STATE/trimmed."*
   ok "re-enabled $n packages"
@@ -347,31 +378,54 @@ cmd_untrim() {
 
 # --------------------------------------------------------------- status ------
 device_summary() {
-  local mem launcher
+  local mem
   mem="$("$ADB" -s "$SERIAL" shell cat /proc/meminfo 2>/dev/null \
         | awk '/MemTotal/{t=$2}/MemAvailable/{a=$2}END{if(t)printf "%.0f/%.0f MB free",a/1024,t/1024}')"
   printf '%s' "${mem:-no meminfo}"
 }
 
+# prints "available_mb total_mb" from the guest
+getprop_pair() {
+  "$ADB" -s "$SERIAL" shell cat /proc/meminfo 2>/dev/null \
+    | awk '/MemTotal/{t=$2}/MemAvailable/{a=$2}END{printf "%.0f %.0f", a/1024, t/1024}'
+}
+
 cmd_status() {
-  if [ ! -f "$STATE/serial" ]; then
+  local json=0
+  [ "${1:-}" = "--json" ] && json=1
+
+  local running=0 serial="" flavor="" booted=false free=0 total=0 rss=0 up=""
+  if [ -f "$STATE/serial" ]; then
+    serial="$(cat "$STATE/serial")"
+    if "$ADB" -s "$serial" get-state >/dev/null 2>&1; then
+      running=1
+      SERIAL="$serial"
+      flavor="$(cat "$STATE/flavor" 2>/dev/null || echo ?)"
+      [ "$("$ADB" -s "$serial" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ] && booted=true
+      read -r free total <<<"$(getprop_pair free total)"
+      up="$("$ADB" -s "$serial" shell cat /proc/uptime 2>/dev/null | awk '{print int($1)}')"
+      rss="$(ps -o rss= -p "$(cat "$STATE/pid" 2>/dev/null || echo 0)" 2>/dev/null | awk '{printf "%d", $1/1024}')"
+    fi
+  fi
+
+  if [ "$json" = 1 ]; then
+    printf '{"running":%s,"serial":"%s","flavor":"%s","booted":%s,' \
+      "$([ "$running" = 1 ] && echo true || echo false)" "$serial" "$flavor" "$booted"
+    printf '"guest":{"free_mb":%s,"total_mb":%s},"host_rss_mb":%s,"uptime_s":%s}\n' \
+      "${free:-0}" "${total:-0}" "${rss:-0}" "${up:-0}"
+    return
+  fi
+
+  if [ "$running" = 0 ]; then
     say "not running"
     return
   fi
-  SERIAL="$(cat "$STATE/serial")"
-  if ! "$ADB" -s "$SERIAL" get-state >/dev/null 2>&1; then
-    say "not running (stale state; try: droidlite stop)"
-    return
-  fi
-  local boot up host
-  boot="$("$ADB" -s "$SERIAL" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')"
-  up="$("$ADB" -s "$SERIAL" shell uptime 2>/dev/null | tr -d '\r')"
-  host="$(ps -o rss= -p "$(cat "$STATE/pid" 2>/dev/null)" 2>/dev/null | awk '{printf "%.0f MB", $1/1024}')"
-  say "serial   $SERIAL  ($(cat "$STATE/flavor" 2>/dev/null || echo ?))"
-  say "booted   ${boot:-0}"
-  say "uptime   ${up:-?}"
-  say "guest    $(device_summary)"
-  say "host     ${host:-?} RSS"
+  SERIAL="$serial"
+  say "serial   $SERIAL  ($flavor)"
+  say "booted   $booted"
+  say "uptime   ${up:-?}s"
+  say "guest    ${free}/${total} MB free"
+  say "host     ${rss} MB RSS"
 }
 
 # --------------------------------------------------------------- device ------
@@ -394,20 +448,28 @@ cmd_inspect() {
   if [ -n "$abis" ] && ! tr ',' '\n' <<<"$abis" | grep -qx x86_64; then
     say ""
     say "${RED}This APK has no x86_64 libraries ($abis).${NC}"
-    say "It will install on droidlite but crash in System.loadLibrary."
-    say "Rebuild with x86_64 in ndk.abiFilters, or test it on a real device."
+    say "The default AOSP image will install it but crash in System.loadLibrary."
+    say "Options: start with --image gapps (ARM64 translation), rebuild with"
+    say "x86_64 in ndk.abiFilters, or test on a real device."
   fi
 }
 
 cmd_install() {
   [ $# -ge 1 ] || die "usage: droidlite install <apk>"
   require_running
-  local apk="$1" pkg abis
+  local apk="$1" pkg abis guest_abis
   [ -f "$apk" ] || die "no such file: $apk"
   abis="$(abi_of_apk "$apk")"
   if [ -n "$abis" ] && ! tr ',' '\n' <<<"$abis" | grep -qx x86_64; then
-    info "warning: APK ships only [$abis]; this image is x86_64-only."
-    info "         it will install but native code will fail to load."
+    guest_abis="$("$ADB" -s "$SERIAL" shell getprop ro.product.cpu.abilist 2>/dev/null | tr -d '\r')"
+    if [[ ",$guest_abis," == *",arm64-v8a,"* ]]; then
+      info "note: APK ships [$abis]; this image translates ARM64, so it will run (slower)."
+      info "      for native speed rebuild with x86_64 in ndk.abiFilters."
+    else
+      info "warning: APK ships only [$abis]; this AOSP image is x86_64-only."
+      info "         it will install but native code will fail to load."
+      info "         use: droidlite stop && droidlite start --image gapps"
+    fi
   fi
   info "installing $(basename "$apk")..."
   if ! "$ADB" -s "$SERIAL" install -r -t "$apk"; then
@@ -439,8 +501,11 @@ cmd_run() {
 
 cmd_logcat() {
   require_running
-  if [ "${1:-}" = "-c" ]; then "$ADB" -s "$SERIAL" logcat -c; ok "logcat cleared"; return; fi
-  "$ADB" -s "$SERIAL" logcat -v color
+  case "${1:-}" in
+    -c) "$ADB" -s "$SERIAL" logcat -c; ok "logcat cleared" ;;
+    -d) "$ADB" -s "$SERIAL" logcat -d ;;
+    *)  "$ADB" -s "$SERIAL" logcat -v color ;;
+  esac
 }
 
 cmd_shot() {
@@ -508,12 +573,22 @@ cmd_doctor() {
   local fail=0
   check() { if eval "$2" >/dev/null 2>&1; then ok "  $1"; else printf '  %s\n' "${RED}FAIL${NC} $1"; fail=1; fi; }
   say "${BOLD}host${NC}"
-  check "KVM device present"          "[ -e /dev/kvm ]"
-  check "KVM usable by this user"     "[ -r /dev/kvm ] && [ -w /dev/kvm ]"
-  check "hardware virtualization"     "grep -qE 'vmx|svm' /proc/cpuinfo"
+  if [ "$(uname -s)" = "Darwin" ]; then
+    check "Hypervisor.framework"      "sysctl -n kern.hv_support 2>/dev/null | grep -q 1"
+  else
+    check "KVM device present"        "[ -e /dev/kvm ]"
+    check "KVM usable by this user"   "[ -r /dev/kvm ] && [ -w /dev/kvm ]"
+    check "hardware virtualization"   "grep -qE 'vmx|svm' /proc/cpuinfo"
+  fi
   check "emulator installed"          "[ -x '$EMULATOR' ]"
   check "platform-tools (adb)"        "[ -x '$ADB' ]"
   check "minimal image installed"     "package_installed '$(image_pkg)'"
+  local sysdir="$SDK/$(image_pkg | tr ';' '/')"
+  if [ -f "$sysdir/build.prop" ] && grep -q 'libndk_translation' "$sysdir/build.prop" 2>/dev/null; then
+    say "  ARM64 translation:  yes (ARM-only APKs will run, slower)"
+  else
+    say "  ARM64 translation:  no (x86_64 APKs only)"
+  fi
   say "${BOLD}resources${NC}"
   say "  host RAM available: $(awk '/MemAvailable/{printf "%.1f GB", $2/1048576}' /proc/meminfo)"
   say "  free disk (/home):  $(df -h "$HOME" | awk 'NR==2{print $4}')"
@@ -527,7 +602,7 @@ case "$cmd" in
   setup)   cmd_setup ;;
   start)   cmd_start "$@" ;;
   stop)    cmd_stop "$@" ;;
-  status)  cmd_status ;;
+  status)  cmd_status "$@" ;;
   install) cmd_install "$@" ;;
   inspect) cmd_inspect "$@" ;;
   run)     cmd_run "$@" ;;
