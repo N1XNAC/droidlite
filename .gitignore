@@ -1,0 +1,4 @@
+.state/
+*.apk
+screen-*.png
+*.log

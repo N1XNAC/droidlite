@@ -1,0 +1,548 @@
+#!/usr/bin/env bash
+# droidlite - a deliberately minimal Android emulator for app testing.
+#
+# It is a thin controller around the stock Android emulator: it pins every
+# setting that costs CPU/RAM but does not help you install and use your app.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# SDK discovery: env first, then the two usual install locations.
+SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+if [ -z "$SDK" ]; then
+  for d in "$HOME/Android/Sdk" "$HOME/android-dev/sdk"; do
+    [ -d "$d" ] && SDK="$d" && break
+  done
+fi
+SDK="${SDK:-$HOME/Android/Sdk}"
+
+if [ -z "${JAVA_HOME:-}" ] && [ -d "$HOME/android-dev/jdk-17.0.21+9" ]; then
+  JAVA_HOME="$HOME/android-dev/jdk-17.0.21+9"
+fi
+export JAVA_HOME
+export ANDROID_HOME="$SDK"
+export ANDROID_SDK_ROOT="$SDK"
+export PATH="$SDK/platform-tools:$SDK/emulator:$SDK/cmdline-tools/latest/bin:$PATH"
+
+ADB="$SDK/platform-tools/adb"
+EMULATOR="$SDK/emulator/emulator"
+SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+AVDMANAGER="$SDK/cmdline-tools/latest/bin/avdmanager"
+AVD_HOME="${ANDROID_AVD_HOME:-$HOME/.android/avd}"
+
+STATE="$ROOT/.state"
+mkdir -p "$STATE"
+
+API="${DROIDLITE_API:-35}"
+FLAVOR="${DROIDLITE_IMAGE:-aosp}"
+PORT="${DROIDLITE_PORT:-5554}"
+SERIAL="emulator-$PORT"
+
+BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GREEN=$'\033[32m'; NC=$'\033[0m'
+say()  { printf '%s\n' "$*"; }
+info() { printf '%s\n' "${DIM}$*${NC}"; }
+ok()   { printf '%s\n' "${GREEN}$*${NC}"; }
+die()  { printf '%s\n' "${RED}error:${NC} $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+droidlite - a trimmed Android emulator for app testing only
+
+Usage: droidlite <command> [options]
+
+  setup                 Download the emulator + minimal system image, build the AVD
+  start                 Boot it (already trimmed on first boot)
+      --image aosp|atd|gapps   System image flavour (default: aosp)
+      --profile low|normal     Resource profile (default: low)
+      --ram MB                 Override guest RAM
+      --cores N                Override vCPU count
+      --headless               No emulator window (view with `droidlite screen`)
+      --gpu host|swiftshader   Rendering backend (default: host, swiftshader when headless)
+      --snapshot               Allow quick-boot snapshot (faster restarts, more disk I/O)
+      --no-trim                Do not apply the debloat list
+  stop                  Shut the emulator down
+  status                What is running and how much RAM it uses
+  install <apk>         adb install + AOT-compile the app
+  inspect <apk>         Show package, SDK level, launch activity and ABIs
+  run <pkg> [activity]  Launch the app and wait for it to be drawn
+  logcat [-c]           Stream logs from the running emulator
+  shot [file.png]       Screenshot
+  screen                Interactive view via scrcpy (headless mode)
+  shell [command...]    adb shell passthrough
+  push <local> <remote> / pull <remote> <local>
+  trim [--no-gms]       Re-apply the debloat list / animation-off settings
+  untrim                Re-enable the disabled system apps
+  reset                 Wipe user data (keeps the AVD + image)
+  prune                 Delete unused emulator pieces (ARM/x86 qemu binaries)
+      --headless                 Also drop Qt + host Vulkan (windowed mode stops working)
+  list                  Show installed images and AVDs
+  doctor                Check KVM, images and hardware
+
+Environment: ANDROID_SDK_ROOT, DROIDLITE_API (default 35),
+             DROIDLITE_IMAGE, DROIDLITE_PORT (default 5554)
+EOF
+}
+
+avd_name() { printf 'dl_%s_%s' "$FLAVOR" "$API"; }
+avd_path() { printf '%s/%s.avd' "$AVD_HOME" "$(avd_name)"; }
+
+image_pkg() {
+  case "$FLAVOR" in
+    aosp)  printf 'system-images;android-%s;default;x86_64' "$API" ;;
+    atd)   printf 'system-images;android-%s;aosp_atd;x86_64' "$API" ;;
+    gapps) printf 'system-images;android-%s;google_apis;x86_64' "$API" ;;
+    *) die "unknown image flavour '$FLAVOR' (use aosp, atd or gapps)" ;;
+  esac
+}
+
+package_installed() {
+  "$SDKMANAGER" --list_installed 2>/dev/null | awk '{print $1}' | grep -qx "$1"
+}
+
+require_running() {
+  [ -f "$STATE/serial" ] || die "no emulator recorded. run: droidlite start"
+  SERIAL="$(cat "$STATE/serial")"
+  "$ADB" -s "$SERIAL" get-state >/dev/null 2>&1 \
+    || die "emulator $SERIAL is not responding (stale state? run: droidlite stop)"
+}
+
+wait_for_boot() {
+  local timeout="${1:-240}" start now
+  start=$(date +%s)
+  info "waiting for $SERIAL to finish booting..."
+  while :; do
+    if [ "$("$ADB" -s "$SERIAL" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]; then
+      # boot_completed fires before the launcher is usable; give it a moment.
+      "$ADB" -s "$SERIAL" shell 'until [ "$(getprop init.svc.bootanim)" = "stopped" ]; do sleep 0.2; done' >/dev/null 2>&1 || true
+      break
+    fi
+    now=$(date +%s)
+    if [ -f "$STATE/pid" ] && ! kill -0 "$(cat "$STATE/pid")" 2>/dev/null; then
+      say ""; tail -n 20 "$STATE/emulator.log" >&2
+      die "emulator exited during boot"
+    fi
+    if [ $((now - start)) -ge "$timeout" ]; then
+      die "boot did not finish in ${timeout}s (see $STATE/emulator.log)"
+    fi
+    sleep 1
+  done
+  ok "booted in $(( $(date +%s) - start ))s"
+}
+
+# ---------------------------------------------------------------- setup ------
+cmd_setup() {
+  [ -x "$EMULATOR" ] || info "installing emulator package..."
+  [ -x "$EMULATOR" ] || "$SDKMANAGER" --install emulator >/dev/null
+
+  local pkg; pkg="$(image_pkg)"
+  if ! package_installed "$pkg"; then
+    info "installing $pkg (about 1.3 GB, one time)..."
+    yes | "$SDKMANAGER" --install "$pkg" >/dev/null
+  fi
+  ok "image ready: $pkg"
+
+  if [ ! -d "$(avd_path)" ]; then
+    info "creating AVD $(avd_name)..."
+    echo no | "$AVDMANAGER" create avd -n "$(avd_name)" -k "$pkg" -d pixel_5 --force >/dev/null
+  fi
+  ok "AVD ready: $(avd_name)  ($(avd_path))"
+  write_config low
+  say ""
+  say "next: droidlite start        (first boot also applies the trim)"
+}
+
+# --------------------------------------------------------------- config ------
+# Every key here is something the emulator can spend resources on.
+# `low` is the point of this project: a 720p screen, 2 vCPUs, no radios,
+# no sensors, no camera, no audio, no SD card, no Play Store, cold boot.
+write_config() {
+  local profile="${1:-low}" ram="${2:-}" cores="${3:-}" cfg ov
+  cfg="$(avd_path)/config.ini"
+  [ -f "$cfg" ] || die "AVD config not found: $cfg (run: droidlite setup)"
+
+  case "$profile" in
+    low)    ram="${ram:-1536}"; cores="${cores:-2}" ;;
+    normal) ram="${ram:-3072}"; cores="${cores:-4}" ;;
+    *) die "unknown profile '$profile'" ;;
+  esac
+
+  ov="$STATE/config.ov"
+  cat > "$ov" <<EOF
+hw.cpu.ncore=$cores
+hw.ramSize=$ram
+vm.heapSize=256
+hw.lcd.width=720
+hw.lcd.height=1280
+hw.lcd.density=320
+hw.gpu.enabled=yes
+hw.gpu.mode=host
+hw.keyboard=yes
+hw.mainKeys=no
+hw.camera.back=none
+hw.camera.front=none
+hw.audioInput=no
+hw.audioOutput=no
+hw.gps=no
+hw.bluetooth=no
+hw.nfc=no
+hw.fingerprint=no
+hw.sdCard=no
+hw.sensors.orientation=no
+hw.sensors.proximity=no
+hw.sensors.magnetic_field=no
+hw.sensors.acceleration=no
+hw.sensors.gyroscope=no
+hw.sensors.temperature=no
+hw.sensors.light=no
+hw.sensors.pressure=no
+hw.sensors.humidity=no
+hw.sensors.heart_rate=no
+hw.sensors.rgbc=no
+hw.trackBall=no
+hw.dPad=no
+showDeviceFrame=no
+PlayStore.enabled=false
+fastboot.forceColdBoot=yes
+disk.dataPartition.size=2048M
+disk.cachePartition.size=64M
+hw.initialOrientation=Portrait
+EOF
+  # drop retired keys, then append ours
+  awk -F= 'NR==FNR{k[$1]=1;next} !($1 in k)' "$ov" "$cfg" > "$cfg.new"
+  cat "$ov" >> "$cfg.new"
+  mv "$cfg.new" "$cfg"
+  # a fixed-skin name would override the 720p geometry above
+  sed -i '/^skin\./d;/^skin=/d' "$cfg"
+}
+
+# ---------------------------------------------------------------- start ------
+cmd_start() {
+  local profile=low ram="" cores="" headless=0 gpu="" cold=1 dotrim=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --image)   FLAVOR="$2"; shift 2 ;;
+      --profile) profile="$2"; shift 2 ;;
+      --ram)     ram="$2"; shift 2 ;;
+      --cores)   cores="$2"; shift 2 ;;
+      --headless) headless=1; shift ;;
+      --gpu)     gpu="$2"; shift 2 ;;
+      --snapshot) cold=0; shift ;;
+      --no-trim) dotrim=0; shift ;;
+      *) die "start: unknown option '$1'" ;;
+    esac
+  done
+  [ -x "$EMULATOR" ] || die "emulator not installed. run: droidlite setup"
+
+  cmd_stop --quiet || true
+  write_config "$profile" "$ram" "$cores"
+
+  local ram_v cores_v; ram_v=$(grep '^hw.ramSize=' "$(avd_path)/config.ini" | cut -d= -f2)
+  cores_v=$(grep '^hw.cpu.ncore=' "$(avd_path)/config.ini" | cut -d= -f2)
+
+  if [ -z "$gpu" ]; then
+    if [ "$headless" = 1 ]; then gpu=swiftshader_indirect; else gpu=host; fi
+  fi
+
+  local args=(
+    -avd "$(avd_name)" -port "$PORT"
+    -gpu "$gpu" -cores "$cores_v" -memory "$ram_v"
+    -no-boot-anim -no-audio -no-metrics -no-passive-gps
+    -camera-back none -camera-front none
+    -netdelay none -netspeed full
+    -partition-size 2048
+  )
+  [ "$headless" = 1 ] && args+=(-no-window)
+  [ "$cold" = 1 ] && args+=(-no-snapshot)
+
+  info "starting $(avd_name) [${profile}: ${cores_v} vCPU / ${ram_v} MB / ${gpu}]"
+  nohup "$EMULATOR" "${args[@]}" > "$STATE/emulator.log" 2>&1 &
+  echo $! > "$STATE/pid"
+  echo "$SERIAL" > "$STATE/serial"
+  echo "$FLAVOR" > "$STATE/flavor"
+  "$ADB" start-server >/dev/null 2>&1 || true
+
+  wait_for_boot
+
+  if [ "$dotrim" = 1 ] && [ ! -f "$STATE/trimmed.$(avd_name)" ]; then
+    cmd_trim --no-gms >/dev/null
+    touch "$STATE/trimmed.$(avd_name)"
+  fi
+
+  say ""
+  say "${BOLD}ready${NC}  $SERIAL   $(device_summary)"
+  [ "$headless" = 1 ] && say "        view: droidlite screen"
+}
+
+cmd_stop() {
+  local quiet=0
+  [ "${1:-}" = "--quiet" ] && quiet=1
+  if [ -f "$STATE/serial" ]; then
+    local s; s="$(cat "$STATE/serial")"
+    "$ADB" -s "$s" emu kill >/dev/null 2>&1 || true
+  fi
+  if [ -f "$STATE/pid" ]; then
+    local p; p="$(cat "$STATE/pid")"
+    if [ -n "$p" ]; then
+      kill "$p" >/dev/null 2>&1 || true
+      local _
+      for _ in $(seq 1 24); do kill -0 "$p" 2>/dev/null || break; sleep 0.25; done
+    fi
+  fi
+  rm -f "$STATE/pid" "$STATE/serial" "$STATE/flavor"
+  [ "$quiet" = 1 ] || ok "stopped"
+}
+
+# ----------------------------------------------------------------- trim ------
+cmd_trim() {
+  local nogms=0
+  [ "${1:-}" = "--no-gms" ] && nogms=1
+  require_running
+
+  info "disabling animations..."
+  for k in window_animation_scale transition_animation_scale animator_duration_scale; do
+    "$ADB" -s "$SERIAL" shell settings put global "$k" 0 >/dev/null 2>&1 || true
+  done
+  # keep the screen awake while you are testing
+  "$ADB" -s "$SERIAL" shell settings put system screen_off_timeout 2147483647 >/dev/null 2>&1 || true
+  "$ADB" -s "$SERIAL" shell settings put global stay_on_while_plugged_in 3 >/dev/null 2>&1 || true
+
+  local files=("$ROOT/trim/debloat-aosp.txt")
+  case "$(cat "$STATE/flavor" 2>/dev/null || echo aosp)" in
+    gapps) files+=("$ROOT/trim/debloat-google.txt") ;;
+  esac
+
+  local installed n=0 pkg
+  installed="$("$ADB" -s "$SERIAL" shell pm list packages 2>/dev/null | tr -d '\r' | sed 's/^package://')"
+  while IFS= read -r pkg; do
+    pkg="${pkg%%#*}"; pkg="$(printf '%s' "$pkg" | tr -d '[:space:]')"
+    [ -z "$pkg" ] && continue
+    grep -qx "$pkg" <<<"$installed" || continue
+    if "$ADB" -s "$SERIAL" shell pm disable-user --user 0 "$pkg" >/dev/null 2>&1; then
+      n=$((n + 1))
+    fi
+  done < <(cat "${files[@]}")
+
+  if [ "$nogms" = 1 ]; then
+    for pkg in com.google.android.gms com.google.android.gsf com.google.android.gms.location.history; do
+      grep -qx "$pkg" <<<"$installed" || continue
+      "$ADB" -s "$SERIAL" shell pm disable-user --user 0 "$pkg" >/dev/null 2>&1 && n=$((n + 1)) || true
+    done
+  fi
+
+  ok "trimmed: $n system apps disabled, animations off"
+  info "$(device_summary)"
+}
+
+cmd_untrim() {
+  require_running
+  local files=("$ROOT/trim/debloat-aosp.txt" "$ROOT/trim/debloat-google.txt") pkg n=0
+  while IFS= read -r pkg; do
+    pkg="${pkg%%#*}"; pkg="$(printf '%s' "$pkg" | tr -d '[:space:]')"
+    [ -z "$pkg" ] && continue
+    if "$ADB" -s "$SERIAL" shell pm enable --user 0 "$pkg" >/dev/null 2>&1; then n=$((n + 1)); fi
+  done < <(cat "${files[@]}")
+  rm -f "$STATE/trimmed."*
+  ok "re-enabled $n packages"
+}
+
+# --------------------------------------------------------------- status ------
+device_summary() {
+  local mem launcher
+  mem="$("$ADB" -s "$SERIAL" shell cat /proc/meminfo 2>/dev/null \
+        | awk '/MemTotal/{t=$2}/MemAvailable/{a=$2}END{if(t)printf "%.0f/%.0f MB free",a/1024,t/1024}')"
+  printf '%s' "${mem:-no meminfo}"
+}
+
+cmd_status() {
+  if [ ! -f "$STATE/serial" ]; then
+    say "not running"
+    return
+  fi
+  SERIAL="$(cat "$STATE/serial")"
+  if ! "$ADB" -s "$SERIAL" get-state >/dev/null 2>&1; then
+    say "not running (stale state; try: droidlite stop)"
+    return
+  fi
+  local boot up host
+  boot="$("$ADB" -s "$SERIAL" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')"
+  up="$("$ADB" -s "$SERIAL" shell uptime 2>/dev/null | tr -d '\r')"
+  host="$(ps -o rss= -p "$(cat "$STATE/pid" 2>/dev/null)" 2>/dev/null | awk '{printf "%.0f MB", $1/1024}')"
+  say "serial   $SERIAL  ($(cat "$STATE/flavor" 2>/dev/null || echo ?))"
+  say "booted   ${boot:-0}"
+  say "uptime   ${up:-?}"
+  say "guest    $(device_summary)"
+  say "host     ${host:-?} RSS"
+}
+
+# --------------------------------------------------------------- device ------
+aapt2_bin() { ls -1d "$SDK"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1; }
+
+abi_of_apk() {
+  local aapt2; aapt2="$(aapt2_bin)"
+  "$aapt2" dump badging "$1" 2>/dev/null | sed -n "s/^native-code: //p" | tr -d "'" | tr ' ' ','
+}
+
+cmd_inspect() {
+  [ $# -ge 1 ] || die "usage: droidlite inspect <apk>"
+  local apk="$1" aapt2; aapt2="$(aapt2_bin)"
+  [ -f "$apk" ] || die "no such file: $apk"
+  "$aapt2" dump badging "$apk" 2>/dev/null \
+    | grep -E "^package:|^sdkVersion:|^targetSdkVersion:|^launchable-activity:|^native-code:" \
+    | sed 's/^/  /'
+  say "  size: $(du -h "$apk" | cut -f1)"
+  local abis; abis="$(abi_of_apk "$apk")"
+  if [ -n "$abis" ] && ! tr ',' '\n' <<<"$abis" | grep -qx x86_64; then
+    say ""
+    say "${RED}This APK has no x86_64 libraries ($abis).${NC}"
+    say "It will install on droidlite but crash in System.loadLibrary."
+    say "Rebuild with x86_64 in ndk.abiFilters, or test it on a real device."
+  fi
+}
+
+cmd_install() {
+  [ $# -ge 1 ] || die "usage: droidlite install <apk>"
+  require_running
+  local apk="$1" pkg abis
+  [ -f "$apk" ] || die "no such file: $apk"
+  abis="$(abi_of_apk "$apk")"
+  if [ -n "$abis" ] && ! tr ',' '\n' <<<"$abis" | grep -qx x86_64; then
+    info "warning: APK ships only [$abis]; this image is x86_64-only."
+    info "         it will install but native code will fail to load."
+  fi
+  info "installing $(basename "$apk")..."
+  if ! "$ADB" -s "$SERIAL" install -r -t "$apk"; then
+    die "install failed (ABI mismatch? see: droidlite doctor)"
+  fi
+  local aapt2
+  aapt2="$(aapt2_bin)"
+  pkg="$("$aapt2" dump badging "$apk" 2>/dev/null | sed -n "s/^package: name='\([^']*\)'.*/\1/p")"
+  if [ -n "$pkg" ]; then
+    info "AOT-compiling $pkg (faster cold starts afterwards)..."
+    "$ADB" -s "$SERIAL" shell cmd package compile -m speed -f "$pkg" >/dev/null 2>&1 || true
+  fi
+  ok "installed${pkg:+: $pkg}"
+}
+
+cmd_run() {
+  [ $# -ge 1 ] || die "usage: droidlite run <package> [activity]"
+  require_running
+  local pkg="$1" comp=""
+  if [ $# -ge 2 ]; then
+    comp="$pkg/$2"
+  else
+    comp="$("$ADB" -s "$SERIAL" shell cmd package resolve-activity --brief "$pkg" 2>/dev/null | tr -d '\r' | tail -1)"
+    [ -n "$comp" ] || die "could not resolve a launch activity for $pkg"
+  fi
+  info "launching $comp"
+  "$ADB" -s "$SERIAL" shell am start -W -n "$comp"
+}
+
+cmd_logcat() {
+  require_running
+  if [ "${1:-}" = "-c" ]; then "$ADB" -s "$SERIAL" logcat -c; ok "logcat cleared"; return; fi
+  "$ADB" -s "$SERIAL" logcat -v color
+}
+
+cmd_shot() {
+  require_running
+  local out="${1:-$ROOT/screen-$(date +%Y%m%d-%H%M%S).png}"
+  "$ADB" -s "$SERIAL" exec-out screencap -p > "$out"
+  ok "screenshot: $out"
+}
+
+cmd_screen() {
+  require_running
+  command -v scrcpy >/dev/null || die "scrcpy not installed"
+  exec scrcpy --serial "$SERIAL" --max-size 1024 --max-fps 30 \
+       --video-bit-rate 2M --no-audio --window-title "droidlite $SERIAL"
+}
+
+cmd_shell() {
+  require_running
+  if [ $# -eq 0 ]; then exec "$ADB" -s "$SERIAL" shell; fi
+  "$ADB" -s "$SERIAL" shell "$@"
+}
+
+cmd_push() { require_running; "$ADB" -s "$SERIAL" push "$@"; }
+cmd_pull() { require_running; "$ADB" -s "$SERIAL" pull "$@"; }
+
+cmd_reset() {
+  cmd_stop --quiet || true
+  local d; d="$(avd_path)"
+  [ -d "$d" ] || die "AVD does not exist (run: droidlite setup)"
+  rm -f "$d"/userdata-qemu.img "$d"/userdata-qemu.img.qcow2 \
+        "$d"/cache.img "$d"/cache.img.qcow2 "$d"/snapshots/*.qcow2 2>/dev/null || true
+  rm -rf "$d/snapshots" "$STATE/trimmed."*
+  ok "user data wiped; next start is a fresh first boot"
+}
+
+cmd_prune() {
+  local emu="$SDK/emulator" before after headless=0
+  [ "${1:-}" = "--headless" ] && headless=1
+  [ -d "$emu" ] || die "emulator not installed"
+  before=$(du -sm "$emu" | cut -f1)
+  # Keep only the x86_64 system emulator: we never run ARM/32-bit guests.
+  find "$emu/qemu/linux-x86_64" -maxdepth 1 -type f -name 'qemu-system-*' \
+       ! -name 'qemu-system-x86_64*' -delete 2>/dev/null || true
+  rm -rf "$emu/lib64/gles_angle" "$emu/crashreport" 2>/dev/null || true
+  if [ "$headless" = 1 ]; then
+    # No window ever: Qt and host-Vulkan support are dead weight.
+    rm -rf "$emu/lib64/qt" "$emu/lib64/vulkan" 2>/dev/null || true
+  fi
+  after=$(du -sm "$emu" | cut -f1)
+  ok "pruned emulator: ${before} MB -> ${after} MB (freed $((before - after)) MB)"
+  if [ "$headless" = 1 ]; then
+    info "headless-only build: use  droidlite start --headless  (gpu forced to swiftshader)"
+  fi
+}
+
+cmd_list() {
+  say "${BOLD}installed images${NC}"
+  "$SDKMANAGER" --list_installed 2>/dev/null | grep 'system-images;' || true
+  say ""
+  say "${BOLD}AVDs${NC}"
+  ls -1 "$AVD_HOME" 2>/dev/null | sed 's/\.avd$//' || true
+}
+
+cmd_doctor() {
+  local fail=0
+  check() { if eval "$2" >/dev/null 2>&1; then ok "  $1"; else printf '  %s\n' "${RED}FAIL${NC} $1"; fail=1; fi; }
+  say "${BOLD}host${NC}"
+  check "KVM device present"          "[ -e /dev/kvm ]"
+  check "KVM usable by this user"     "[ -r /dev/kvm ] && [ -w /dev/kvm ]"
+  check "hardware virtualization"     "grep -qE 'vmx|svm' /proc/cpuinfo"
+  check "emulator installed"          "[ -x '$EMULATOR' ]"
+  check "platform-tools (adb)"        "[ -x '$ADB' ]"
+  check "minimal image installed"     "package_installed '$(image_pkg)'"
+  say "${BOLD}resources${NC}"
+  say "  host RAM available: $(awk '/MemAvailable/{printf "%.1f GB", $2/1048576}' /proc/meminfo)"
+  say "  free disk (/home):  $(df -h "$HOME" | awk 'NR==2{print $4}')"
+  [ "$fail" = 0 ] && ok "all checks passed"
+}
+
+# ----------------------------------------------------------------- main ------
+[ $# -gt 0 ] || { usage; exit 0; }
+cmd="$1"; shift
+case "$cmd" in
+  setup)   cmd_setup ;;
+  start)   cmd_start "$@" ;;
+  stop)    cmd_stop "$@" ;;
+  status)  cmd_status ;;
+  install) cmd_install "$@" ;;
+  inspect) cmd_inspect "$@" ;;
+  run)     cmd_run "$@" ;;
+  logcat)  cmd_logcat "$@" ;;
+  shot)    cmd_shot "$@" ;;
+  screen)  cmd_screen ;;
+  shell)   cmd_shell "$@" ;;
+  push)    cmd_push "$@" ;;
+  pull)    cmd_pull "$@" ;;
+  trim)    cmd_trim "$@" ;;
+  untrim)  cmd_untrim ;;
+  reset)   cmd_reset ;;
+  prune)   cmd_prune ;;
+  list)    cmd_list ;;
+  doctor)  cmd_doctor ;;
+  -h|--help|help) usage ;;
+  *) die "unknown command '$cmd' (try: droidlite --help)" ;;
+esac
